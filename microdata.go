@@ -10,246 +10,205 @@ package microdata
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/url"
+	"reflect"
 	"strings"
+	"unicode"
 
-	"golang.org/x/net/html"
-	"golang.org/x/net/html/atom"
+	"github.com/diggernaut/cast"
+	"github.com/diggernaut/goquery"
 )
 
-type valueList []interface{}
-type propertyMap map[string]valueList
-
-// Item represents a microdata item
-type Item struct {
-	Properties propertyMap `json:"properties"`
-	Types      []string    `json:"type,omitempty"`
-	ID         string      `json:"id,omitempty"`
+// Parser is an HTML parser that extracts microdata
+type Parser struct {
+	r    io.Reader
+	Microdata map[string]interface{}
+	baseURL *url.URL
 }
 
-// NewItem creates a new microdata item
-func NewItem() *Item {
-	return &Item{
-		Properties: make(propertyMap, 0),
-		Types:      make([]string, 0),
-	}
-}
-
-// AddString adds a string type item property value
-func (i *Item) AddString(property string, value string) {
-	i.Properties[property] = append(i.Properties[property], value)
-}
-
-// AddItem adds an Item type item property value
-func (i *Item) AddItem(property string, value *Item) {
-	i.Properties[property] = append(i.Properties[property], value)
-}
-
-// AddType adds a type to the item
-func (i *Item) AddType(value string) {
-	i.Types = append(i.Types, value)
-}
-
-// Microdata represents a set of microdata items
-type Microdata struct {
-	Items []*Item `json:"items"`
-}
-
-// NewMicrodata creates a new microdata set
-func NewMicrodata() *Microdata {
-	return &Microdata{
-		Items: make([]*Item, 0),
-	}
-}
-
-// AddItem adds an item to the microdata set
-func (m *Microdata) AddItem(value *Item) {
-	m.Items = append(m.Items, value)
-}
-
-// JSON converts the microdata set to JSON
-func (m *Microdata) JSON() ([]byte, error) {
-	b, err := json.Marshal(m)
+// JSON converts the data object to JSON
+func (p *Parser) JSON() ([]byte, error) {
+	b, err := json.Marshal(p.object)
 	if err != nil {
 		return nil, err
 	}
 	return b, nil
 }
 
-// Parser is an HTML parser that extracts microdata
-type Parser struct {
-	r               io.Reader
-	data            *Microdata
-	base            *url.URL
-	identifiedNodes map[string]*html.Node
-}
-
 // NewParser creates a new parser for extracting microdata
 // r is a reader over an HTML document
-// base is the base URL for resolving relative URLs
-func NewParser(r io.Reader, base *url.URL) *Parser {
+// baseURL is the base URL for resolving relative URLs
+func NewParser(r io.Reader, baseURL *url.URL) *Parser {
 	return &Parser{
 		r:    r,
-		data: NewMicrodata(),
-		base: base,
+		object: nil,
+		baseURL: baseURL,
 	}
 }
 
-// Parse the document and return a Microdata set
-func (p *Parser) Parse() (*Microdata, error) {
-	tree, err := html.Parse(p.r)
+// Parse the document and return an error if there is any issue with parsing
+func (p *Parser) Parse() (error) {
+	dom, err := goquery.NewDocumentFromReader(p.r)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	topLevelItemNodes := make([]*html.Node, 0)
-	p.identifiedNodes = make(map[string]*html.Node, 0)
-
-	walk(tree, func(n *html.Node) {
-		if n.Type == html.ElementNode {
-			if _, exists := getAttr("itemscope", n); exists {
-				if _, exists := getAttr("itemprop", n); !exists {
-					topLevelItemNodes = append(topLevelItemNodes, n)
-				}
+	// Doing DOM clean-up, filter out nodes without microdata markup
+	selector := dom.Find("[itemprop],[itemscope]")
+	selector2 := dom.Find("*")
+	selector2.Each(func(i int, s2 *goquery.Selection) {
+		found := false
+		selector.Each(func(i int, s *goquery.Selection) {
+			if s2.IsSelection(s) {
+				found = true
+				return
 			}
-
-			if id, exists := getAttr("id", n); exists {
-				p.identifiedNodes[id] = n
+			sel := s2.HasSelection(s)
+			if sel.Length() > 0 {
+				found = true
+				return
 			}
+		})
+		if !found {
+			s2.Remove()
 		}
 	})
-
-	for _, node := range topLevelItemNodes {
-		p.data.Items = append(p.data.Items, p.readItem(nil, node))
+	selector = dom.Find(":not([itemprop],[itemscope])")
+	for selector.Length() > 0 {
+		selector.Each(func(i int, s *goquery.Selection) {
+			if _, ok := s.Attr("itemprop"); ok {
+				return
+			}
+			if _, ok := s.Attr("itemscope"); ok {
+				return
+			}
+			html, _ := s.Html()
+			s.ReplaceWithHtml(html)
+		})
+		selector = dom.Find(":not([itemprop],[itemscope])")
 	}
 
-	return p.data, nil
+	// Parsing DOM with microdata to the object
+	p.object = make(map[string]interface{})
+	selector = dom.ChildrenFiltered("*")
+	selector.Each(func(i int, s *goquery.Selection) {
+		p.extractItem(s, p.object)
+	})
+
+	return nil
 }
 
-func (p *Parser) readItem(item *Item, node *html.Node) *Item {
-	var parent *Item
-
-	if _, exists := getAttr("itemscope", node); exists {
-		parent, item = item, NewItem()
-
-		if itemtypes, exists := getAttr("itemtype", node); exists {
-			for _, itemtype := range strings.Split(strings.TrimSpace(itemtypes), " ") {
-				itemtype = strings.TrimSpace(itemtype)
-				if itemtype != "" {
-					item.Types = append(item.Types, itemtype)
-				}
-			}
-			// itemid only valid when itemscope and itemtype are both present
-			if itemid, exists := getAttr("itemid", node); exists {
-				if parsedURL, err := p.base.Parse(itemid); err == nil {
-					item.ID = parsedURL.String()
-				}
-			}
-		}
-
-		if itemrefs, exists := getAttr("itemref", node); exists {
-			for _, itemref := range strings.Split(strings.TrimSpace(itemrefs), " ") {
-				itemref = strings.TrimSpace(itemref)
-
-				if refnode, exists := p.identifiedNodes[itemref]; exists {
-					if refnode != node {
-						p.readItem(item, refnode)
-					}
-				}
+func (p *Parser) extractItem(selector *goquery.Selection, item map[string]interface{}) {
+	var fieldname string
+	if itemprop, ok := selector.Attr("itemprop"); ok {
+		fieldname = itemprop
+	} else {
+		if itemtype, ok := selector.Attr("itemtype"); ok {
+			itemtypeComponents := strings.Split(itemtype, "/")
+			if len(itemtypeComponents) > 0 {
+				fieldname = itemtypeComponents[len(itemtypeComponents)-1]
+			} else {
+				fieldname = itemtype
 			}
 		}
 	}
-
-	if itemprop, exists := getAttr("itemprop", node); exists {
-		if parent != nil {
-			// an itemprop on an itemscope has value of the item created by the itemscope
-			for _, propertyName := range strings.Split(strings.TrimSpace(itemprop), " ") {
-				propertyName = strings.TrimSpace(propertyName)
-				if propertyName != "" {
-					parent.AddItem(propertyName, item)
+	fmt.Printf("FIELD: %v\n", fieldname)
+	sel := selector.ChildrenFiltered("*")
+	if sel.Length() > 0 {
+		newItem := make(map[string]interface{})
+		if href, ok := selector.Attr("href"); ok {
+			fmt.Printf("HREF: %v\n", href)
+			if href != "" {
+				relURL, err := url.Parse(href)
+				if err == nil {
+					url := p.base.ResolveReference(relURL)
+					newItem["url"] = url.String()
 				}
+			}
+		}
+		sel.Each(func(i int, s *goquery.Selection) {
+			p.extractItem(s, newItem)
+		})
+		if currentValue, ok := item[fieldname]; ok {
+			if it := reflect.TypeOf(currentValue).Kind(); it == reflect.Slice {
+				anArray := cast.ToSlice(currentValue)
+				anArray = append(anArray, newItem)
+				item[fieldname] = anArray
+			} else {
+				var anArray []interface{}
+				anArray = append(anArray, currentValue, newItem)
+				item[fieldname] = anArray
 			}
 		} else {
-			var propertyValue string
-
-			switch node.DataAtom {
-			case atom.Meta:
-				if val, exists := getAttr("content", node); exists {
-					propertyValue = val
-				}
-			case atom.Audio, atom.Embed, atom.Iframe, atom.Img, atom.Source, atom.Track, atom.Video:
-				if urlValue, exists := getAttr("src", node); exists {
-					if parsedURL, err := p.base.Parse(urlValue); err == nil {
-						propertyValue = parsedURL.String()
-					}
-				}
-			case atom.A, atom.Area, atom.Link:
-				if urlValue, exists := getAttr("href", node); exists {
-					if parsedURL, err := p.base.Parse(urlValue); err == nil {
-						propertyValue = parsedURL.String()
-					}
-				}
-			case atom.Object:
-				if urlValue, exists := getAttr("data", node); exists {
-					propertyValue = urlValue
-				}
-			case atom.Data, atom.Meter:
-				if urlValue, exists := getAttr("value", node); exists {
-					propertyValue = urlValue
-				}
-			case atom.Time:
-				if urlValue, exists := getAttr("datetime", node); exists {
-					propertyValue = urlValue
-				}
-
-			default:
-				var text bytes.Buffer
-				walk(node, func(n *html.Node) {
-					if n.Type == html.TextNode {
-						text.WriteString(n.Data)
-					}
-
-				})
-				propertyValue = text.String()
+			item[fieldname] = newItem
+		}
+	} else {
+		value := ""
+		if content, ok := selector.Attr("content"); ok {
+			fmt.Printf("CONTENT: %v\n", content)
+			if content != "" {
+				value = content
 			}
-
-			if len(propertyValue) > 0 {
-				for _, propertyName := range strings.Split(strings.TrimSpace(itemprop), " ") {
-					propertyName = strings.TrimSpace(propertyName)
-					if propertyName != "" {
-						item.AddString(propertyName, propertyValue)
+		}
+		if value == "" {
+			if content, ok := selector.Attr("href"); ok {
+				fmt.Printf("HREF: %v\n", content)
+				if content != "" {
+					relURL, err := url.Parse(content)
+					if err == nil {
+						url := p.base.ResolveReference(relURL)
+						value = url.String()
 					}
 				}
 			}
 		}
-	}
-
-	for child := node.FirstChild; child != nil; {
-		p.readItem(item, child)
-		child = child.NextSibling
-	}
-
-	return item
-}
-
-func getAttr(name string, node *html.Node) (string, bool) {
-	for _, a := range node.Attr {
-		if a.Key == name {
-			return a.Val, true
+		if value == "" {
+			if content, ok := selector.Attr("src"); ok {
+				fmt.Printf("SRC: %v\n", content)
+				if content != "" {
+					relURL, err := url.Parse(content)
+					if err == nil {
+						url := p.base.ResolveReference(relURL)
+						value = url.String()
+					}
+				}
+			}
+		}
+		if value == "" {
+			text := strings.TrimSpace(stringMinifier(selector.Text()))
+			fmt.Printf("TEXT: %v\n", text)
+			value = text
+		}
+		if currentValue, ok := item[fieldname]; ok {
+			if it := reflect.TypeOf(currentValue).Kind(); it == reflect.Slice {
+				anArray := cast.ToSlice(currentValue)
+				anArray = append(anArray, value)
+				item[fieldname] = anArray
+			} else {
+				var anArray []interface{}
+				anArray = append(anArray, currentValue, value)
+				item[fieldname] = anArray
+			}
+		} else {
+			item[fieldname] = value
 		}
 	}
-	return "", false
 }
 
-func walk(parent *html.Node, fn func(n *html.Node)) {
-	if parent == nil {
-		return
+func stringMinifier(in string) string {
+	buf := bytes.NewBufferString("")
+	white := false
+	for _, c := range in {
+		if unicode.IsSpace(c) {
+			if !white {
+				buf.WriteString(" ")
+			}
+			white = true
+		} else {
+			buf.WriteString(string(c))
+			white = false
+		}
 	}
-	fn(parent)
-
-	for child := parent.FirstChild; child != nil; {
-		walk(child, fn)
-		child = child.NextSibling
-	}
+	return buf.String()
 }
